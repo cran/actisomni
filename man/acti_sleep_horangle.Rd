@@ -11,14 +11,15 @@ acti_sleep_horangle(
   horizontal_threshold = 45,
   ignore_invalid = FALSE,
   min_block_minutes = 30,
-  max_gap_minutes = 60
+  max_gap_minutes = 60,
+  smooth = c("rollmedian", "none")
 )
 }
 \arguments{
 \item{data}{A data frame of raw accelerometer observations.}
 
-\item{epoch}{Epoch used to average raw angles, passed to
-\code{\link[lubridate:floor_date]{lubridate::floor_date()}}.}
+\item{epoch}{Epoch used to average raw angles, in seconds or a string
+such as \code{"5 seconds"}; see \code{\link[actibase:acti_standardize_epoch]{actibase::acti_standardize_epoch()}}.}
 
 \item{longitudinal_axis}{Raw axis used as the longitudinal axis: \code{"X"},
 \code{"Y"}, or \code{"Z"}.}
@@ -31,6 +32,14 @@ use \code{NA} to treat them as no movement.}
 \item{min_block_minutes}{Minimum low-movement block duration.}
 
 \item{max_gap_minutes}{Maximum interruption bridged between blocks.}
+
+\item{smooth}{Smoothing of the raw axes before the angle is computed:
+\code{"rollmedian"} (the default) takes a five-second rolling median of each
+axis first, as described by van Hees et al. (2015, 2018) and implemented
+in GGIR, so angles agree with GGIR's \code{anglez}; \code{"none"} computes the
+angle from each raw sample, as in actisomni 0.3.0 and earlier.  The
+median is taken over samples, not time, so \code{"rollmedian"} warns when the
+timestamps have gaps; fill or resample such data first.}
 }
 \value{
 An \code{acti_sleep_guider} object. \code{window} marks the longest selected

@@ -122,10 +122,56 @@
   ), details), class = "acti_sleep_guider")
 }
 
-.acti_sleep_raw_angles <- function(data, epoch, longitudinal_axis = "Z") {
+# Five-second rolling median of one axis, as in GGIR's g.applymetrics():
+# taken on every floor(sf / 10)-th sample (about 10 Hz), with an odd window,
+# then repeated back to the original sample rate.  Unlike GGIR, which keeps
+# the unsmoothed axis when the repeated series is longer than the input, the
+# repeated series is truncated (https://github.com/wadpac/GGIR/issues/1562).
+.acti_sleep_rollmedian <- function(x, sample_rate) {
+  n <- length(x)
+  step <- max(floor(sample_rate / 10), 1)
+  new_rate <- if (step > 1) 10 else sample_rate
+  k <- round(new_rate * 5)
+  if (k %% 2 == 0) k <- k + 1
+  xm <- x[seq(1, n, by = step)]
+  if (length(xm) >= k) xm <- stats::runmed(xm, k, endrule = "constant")
+  xm <- rep(xm, each = step)
+  if (length(xm) >= n) xm[seq_len(n)] else c(xm, rep(xm[length(xm)], n - length(xm)))
+}
+
+# Standardize raw data and apply the rolling median to each axis.  The median
+# is taken over sample indices, so it spans the wrong amount of time when
+# samples are missing; warn when consecutive samples are further apart than
+# 1.5 sample periods.
+.acti_sleep_smooth_axes <- function(data) {
+  sample_rate <- actibase::get_sample_rate(data)
   data <- actibase::acti_standardize_data(
     data, subset_xyz = FALSE, check_xyz = TRUE
   )
+  dt <- diff(as.numeric(data$time))
+  n_gaps <- sum(dt > 1.5 / sample_rate, na.rm = TRUE)
+  if (n_gaps > 0) {
+    warning(sprintf(paste0(
+      "`data` has %d gap(s) longer than 1.5 samples at %g Hz; the rolling ",
+      "median spans them as if the samples were contiguous. Fill or resample ",
+      "the data first (e.g. actibase::acti_resample()), or use ",
+      "`smooth = \"none\"`."), n_gaps, sample_rate), call. = FALSE)
+  }
+  for (axis in c("X", "Y", "Z")) {
+    data[[axis]] <- .acti_sleep_rollmedian(data[[axis]], sample_rate)
+  }
+  data
+}
+
+.acti_sleep_raw_angles <- function(data, epoch, longitudinal_axis = "Z",
+                                   smooth = c("rollmedian", "none")) {
+  epoch <- actibase::acti_standardize_epoch(epoch, output = "character")
+  smooth <- match.arg(smooth)
+  data <- if (smooth == "rollmedian") {
+    .acti_sleep_smooth_axes(data)
+  } else {
+    actibase::acti_standardize_data(data, subset_xyz = FALSE, check_xyz = TRUE)
+  }
   longitudinal_axis <- match.arg(longitudinal_axis, c("X", "Y", "Z"))
 
   data |>
@@ -171,17 +217,37 @@
 #' Implements the HDCZA sleep-period-time guider for wrist accelerometry.  It
 #' finds prolonged periods of little change in the supplied z-axis angle, joins
 #' interruptions shorter than an hour, and returns the longest resulting block.
-#' The default threshold is the 0.2 degrees specified in the GGIR guider
-#' documentation.
+#' As in GGIR, the default threshold is derived from the recording: 15 times
+#' the 10th percentile of the five-minute rolling median absolute angle change,
+#' limited to between 0.13 and 0.5 degrees. Setting `threshold` gives a fixed
+#' threshold in degrees instead (e.g. `threshold = 0.2`, the previous default).
+#' GGIR's `HDCZA_threshold = c(p, m)` corresponds to
+#' `threshold_percentile = p, threshold_multiplier = m`.
 #'
 #' @param data A data frame of raw accelerometer observations.
-#' @param epoch Epoch used to average raw angles, passed to
-#'   [lubridate::floor_date()].
-#' @param threshold Maximum five-minute rolling median absolute angle change.
+#' @param epoch Epoch used to average raw angles, in seconds or a string
+#'   such as `"5 seconds"`; see [actibase::acti_standardize_epoch()]. Must be
+#'   at most 200 seconds so that each five-minute window holds at least two
+#'   angles.
+#' @param threshold Fixed maximum five-minute rolling median absolute angle
+#'   change, in degrees. The default, `NULL`, derives the threshold from the
+#'   recording using `threshold_percentile` and `threshold_multiplier`.
+#' @param threshold_percentile Percentile, between 1 and 100, of the rolling
+#'   median absolute angle change used for the data-driven threshold. Ignored
+#'   when `threshold` is set.
+#' @param threshold_multiplier Positive multiplier applied to that percentile
+#'   for the data-driven threshold. Ignored when `threshold` is set.
 #' @param ignore_invalid Whether invalid observations are treated as movement;
 #'   use `NA` to treat them as no movement.
 #' @param min_block_minutes Minimum low-movement block duration.
 #' @param max_gap_minutes Maximum interruption bridged between blocks.
+#' @param smooth Smoothing of the raw axes before the angle is computed:
+#'   `"rollmedian"` (the default) takes a five-second rolling median of each
+#'   axis first, as described by van Hees et al. (2015, 2018) and implemented
+#'   in GGIR, so angles agree with GGIR's `anglez`; `"none"` computes the
+#'   angle from each raw sample, as in actisomni 0.3.0 and earlier.  The
+#'   median is taken over samples, not time, so `"rollmedian"` warns when the
+#'   timestamps have gaps; fill or resample such data first.
 #' @return An `acti_sleep_guider` object. `window` is the selected SPT guider;
 #'   `crude_window` retains all candidate blocks before choosing the longest.
 #' @examples
@@ -191,12 +257,22 @@
 #' hdcza <- acti_sleep_hdcza(raw, epoch = "5 seconds")
 #' }
 #' @export
-acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
+acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = NULL,
+                             threshold_percentile = 10,
+                             threshold_multiplier = 15,
                              ignore_invalid = FALSE, min_block_minutes = 30,
-                             max_gap_minutes = 60) {
-  epoch_data <- .acti_sleep_raw_angles(data, epoch)
+                             max_gap_minutes = 60,
+                             smooth = c("rollmedian", "none")) {
+  if (!is.null(threshold) &&
+      (!missing(threshold_percentile) || !missing(threshold_multiplier))) {
+    warning("`threshold` is set, so `threshold_percentile` and ",
+            "`threshold_multiplier` are ignored.", call. = FALSE)
+  }
+  epoch_data <- .acti_sleep_raw_angles(data, epoch, smooth = smooth)
   out <- .acti_sleep_hdcza_angle(
     epoch_data$angle, time = epoch_data$time, threshold = threshold,
+    threshold_percentile = threshold_percentile,
+    threshold_multiplier = threshold_multiplier,
     invalid = epoch_data$invalid, ignore_invalid = ignore_invalid,
     min_block_minutes = min_block_minutes, max_gap_minutes = max_gap_minutes
   )
@@ -204,7 +280,9 @@ acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
   out
 }
 
-.acti_sleep_hdcza_angle <- function(angle, time, threshold = 0.2,
+.acti_sleep_hdcza_angle <- function(angle, time, threshold = NULL,
+                                    threshold_percentile = 10,
+                                    threshold_multiplier = 15,
                                     invalid = NULL, ignore_invalid = FALSE,
                                     min_block_minutes = 30,
                                     max_gap_minutes = 60) {
@@ -212,8 +290,22 @@ acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
   n <- length(angle)
   epoch_seconds <- .acti_sleep_epoch_seconds(time)
   assertthat::assert_that(
-    assertthat::is.number(threshold), threshold >= 0,
-    msg = "`threshold` must be one non-negative number."
+    is.null(threshold) ||
+      (assertthat::is.number(threshold) && is.finite(threshold) &&
+         threshold >= 0),
+    msg = "`threshold` must be `NULL` or one non-negative number of degrees."
+  )
+  assertthat::assert_that(
+    assertthat::is.number(threshold_percentile),
+    is.finite(threshold_percentile),
+    threshold_percentile >= 1, threshold_percentile <= 100,
+    msg = paste0("`threshold_percentile` must be one number between 1 and ",
+                 "100 (e.g. 10 for the 10th percentile).")
+  )
+  assertthat::assert_that(
+    assertthat::is.number(threshold_multiplier),
+    is.finite(threshold_multiplier), threshold_multiplier > 0,
+    msg = "`threshold_multiplier` must be one positive number."
   )
   if (is.null(invalid)) invalid <- rep(FALSE, n)
   assertthat::assert_that(
@@ -222,12 +314,24 @@ acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
   )
 
   width <- max(1L, round(5 * 60 / epoch_seconds))
-  angle_change <- abs(diff(angle))
-  rolling_change <- .acti_sleep_roll_apply(
-    angle_change, width, function(x) stats::median(x, na.rm = TRUE)
+  assertthat::assert_that(
+    width >= 2L,
+    msg = paste0("HDCZA needs at least two angles per five-minute window; ",
+                 "use an `epoch` of at most 200 seconds (e.g. \"5 seconds\").")
   )
-  # diff() is one observation shorter; its last rolling value is not needed.
-  rolling_change <- c(rolling_change, 0)[seq_len(n)]
+  # As in GGIR: the median absolute angle change within each centred
+  # five-minute window of angles
+  rolling_change <- .acti_sleep_roll_apply(
+    angle, width, function(x) stats::median(abs(diff(x)), na.rm = TRUE)
+  )
+  if (is.null(threshold)) {
+    # GGIR's data-driven HDCZA threshold, bounded to 0.13--0.5 degrees
+    threshold <- stats::quantile(rolling_change,
+                                 probs = threshold_percentile / 100,
+                                 names = FALSE, na.rm = TRUE) *
+      threshold_multiplier
+    threshold <- min(max(threshold, 0.13), 0.5)
+  }
   low_movement <- rolling_change < threshold
   invalid <- as.logical(invalid)
   if (is.na(ignore_invalid)) {
@@ -254,6 +358,8 @@ acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
 #' Identify a sleep window from horizontal posture
 #'
 #' @inheritParams acti_sleep_hdcza
+#' @param epoch Epoch used to average raw angles, in seconds or a string
+#'   such as `"5 seconds"`; see [actibase::acti_standardize_epoch()].
 #' @param horizontal_threshold Absolute-angle limit defining horizontal posture.
 #' @param longitudinal_axis Raw axis used as the longitudinal axis: `"X"`,
 #'   `"Y"`, or `"Z"`.
@@ -269,8 +375,10 @@ acti_sleep_hdcza <- function(data, epoch = "5 seconds", threshold = 0.2,
 #'   limit, and `epoch_data` contains the averaged angle and invalid flag.
 acti_sleep_horangle <- function(data, epoch = "5 seconds", longitudinal_axis = "Z",
                                 horizontal_threshold = 45, ignore_invalid = FALSE,
-                                min_block_minutes = 30, max_gap_minutes = 60) {
-  epoch_data <- .acti_sleep_raw_angles(data, epoch, longitudinal_axis)
+                                min_block_minutes = 30, max_gap_minutes = 60,
+                                smooth = c("rollmedian", "none")) {
+  epoch_data <- .acti_sleep_raw_angles(data, epoch, longitudinal_axis,
+                                       smooth = smooth)
   out <- .acti_sleep_horangle_angle(
     epoch_data$angle, time = epoch_data$time,
     horizontal_threshold = horizontal_threshold, invalid = epoch_data$invalid,
@@ -748,10 +856,12 @@ acti_sleep_fuse_labels <- function(labels, threshold = 0.5, tolerance = 1e-6,
 #'
 #' @param data Raw triaxial or regular epoch-level data.
 #' @param method SIB method: `"vanHees2015"` or `"low_activity"`.
-#' @param epoch Raw-data aggregation epoch.
+#' @param epoch Raw-data aggregation epoch, in seconds or a string such as
+#'   `"5 seconds"`; see [actibase::acti_standardize_epoch()].
 #' @param time_threshold_minutes,angle_threshold van Hees posture-change
 #'   parameters.
 #' @param activity_threshold Low-activity cutoff for epoch data.
+#' @inheritParams acti_sleep_hdcza
 #' @return A tibble with `time`, `sib`, and supporting epoch-level variables.
 #' @examples
 #' \donttest{
@@ -761,7 +871,8 @@ acti_sleep_fuse_labels <- function(labels, threshold = 0.5, tolerance = 1e-6,
 #' @export
 acti_sleep_sib <- function(data, method = c("vanHees2015", "low_activity"),
                            epoch = "5 seconds", time_threshold_minutes = 5,
-                           angle_threshold = 5, activity_threshold = 0) {
+                           angle_threshold = 5, activity_threshold = 0,
+                           smooth = c("rollmedian", "none")) {
   method <- match.arg(method)
   standard <- actibase::acti_standardize_data(
     data, subset_xyz = FALSE, check_xyz = FALSE
@@ -771,7 +882,7 @@ acti_sleep_sib <- function(data, method = c("vanHees2015", "low_activity"),
   if (method == "vanHees2015") {
     assertthat::assert_that(raw,
       msg = "`vanHees2015` requires raw triaxial acceleration (X, Y, and Z).")
-    epochs <- .acti_sleep_raw_angles(data, epoch)
+    epochs <- .acti_sleep_raw_angles(data, epoch, smooth = smooth)
     epoch_seconds <- .acti_sleep_epoch_seconds(epochs$time)
     epochs$sib <- .acti_sleep_vanhees_sib(
       epochs$angle, epoch_seconds, time_threshold_minutes, angle_threshold
@@ -802,10 +913,12 @@ acti_sleep_sib <- function(data, method = c("vanHees2015", "low_activity"),
 #'   a `sib` column or a conventional activity column.
 #' @param guiders Guider names. Defaults depend on whether raw acceleration is
 #'   available.
-#' @param epoch Raw-data aggregation epoch.
+#' @param epoch Raw-data aggregation epoch, in seconds or a string such as
+#'   `"5 seconds"`; see [actibase::acti_standardize_epoch()].
 #' @param sib_method SIB method, passed to `acti_sleep_sib()`.
 #' @param fusion Consensus rule: `"staple"` or `"majority"`.
 #' @param sleepwindow_type SPT or TimeInBed overlap rule.
+#' @inheritParams acti_sleep_hdcza
 #' @param ... Passed to the individual guider functions.
 #' @return A list of time-indexed data. `epoch_data` includes the van Hees
 #'   `sib`; each guider has a `label_data` element with `time` and `window`;
@@ -821,15 +934,24 @@ acti_sleep_sib <- function(data, method = c("vanHees2015", "low_activity"),
 acti_sleep_ensemble <- function(data, guiders = NULL, epoch = "5 seconds",
                                 sib_method = "vanHees2015",
                                 fusion = c("staple", "majority"),
-                                sleepwindow_type = c("SPT", "TimeInBed"), ...) {
+                                sleepwindow_type = c("SPT", "TimeInBed"),
+                                smooth = c("rollmedian", "none"), ...) {
   fusion <- match.arg(fusion)
+  smooth <- match.arg(smooth)
   sleepwindow_type <- match.arg(sleepwindow_type)
+  epoch <- actibase::acti_standardize_epoch(epoch, output = "character")
   standard <- actibase::acti_standardize_data(
     data, subset_xyz = FALSE, check_xyz = FALSE
   )
   raw <- all(c("X", "Y", "Z") %in% names(standard))
   if (!raw && identical(sib_method, "vanHees2015")) {
     sib_method <- "low_activity"
+  }
+  # Smooth once for all angle-based steps; ENMO below uses the raw axes.
+  angle_data <- data
+  if (raw && smooth == "rollmedian") {
+    angle_data <- .acti_sleep_smooth_axes(data)
+    smooth <- "none"
   }
   if (is.null(guiders)) {
     default_guiders <- if (raw) c("HDCZA", "HorAngle", "setwindow") else {
@@ -838,7 +960,7 @@ acti_sleep_ensemble <- function(data, guiders = NULL, epoch = "5 seconds",
     l5_hours <- list(...)[["l5_hours"]]
     if (is.null(l5_hours)) l5_hours <- 5
     candidate_epochs <- if (raw) {
-      .acti_sleep_raw_angles(data, epoch)
+      .acti_sleep_raw_angles(angle_data, epoch, smooth = smooth)
     } else {
       .acti_sleep_epoch_data(data)
     }
@@ -850,7 +972,10 @@ acti_sleep_ensemble <- function(data, guiders = NULL, epoch = "5 seconds",
     c("HDCZA", "HorAngle", "L5", "NotWorn", "setwindow")),
     msg = "`guiders` contains an unsupported ensemble guider.")
 
-  sib_data <- acti_sleep_sib(data, method = sib_method, epoch = epoch)
+  sib_data <- acti_sleep_sib(
+    if (identical(sib_method, "vanHees2015")) angle_data else data,
+    method = sib_method, epoch = epoch, smooth = smooth
+  )
   epoch_data <- sib_data
   if (!raw) {
     activity_data <- .acti_sleep_activity_data(data) |>
@@ -873,8 +998,9 @@ acti_sleep_ensemble <- function(data, guiders = NULL, epoch = "5 seconds",
 
   guider_objects <- lapply(guiders, function(method) {
     switch(method,
-      HDCZA = acti_sleep_hdcza(data, epoch = epoch, ...),
-      HorAngle = acti_sleep_horangle(data, epoch = epoch, ...),
+      HDCZA = acti_sleep_hdcza(angle_data, epoch = epoch, smooth = smooth, ...),
+      HorAngle = acti_sleep_horangle(angle_data, epoch = epoch,
+                                     smooth = smooth, ...),
       L5 = acti_sleep_l5(epoch_data, ...),
       NotWorn = acti_sleep_notworn(epoch_data, ...),
       setwindow = acti_sleep_setwindow(epoch_data, ...)
